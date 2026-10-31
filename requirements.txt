@@ -13,3 +13,8 @@ screen-brightness-control>=0.24.2
 winsdk>=1.0.0b10
 rapidfuzz>=3.9
 pywinauto>=0.6.9 ; sys_platform == "win32"
+edge-tts>=6.1
+pypdf>=4.0
+python-docx>=1.1
+keyring>=24.0
+tiktoken>=0.9

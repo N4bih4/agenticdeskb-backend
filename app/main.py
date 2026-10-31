@@ -4,6 +4,7 @@ from __future__ import annotations
 import platform
 import json
 import secrets
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +38,8 @@ from .schemas import (
 from .tools.base import ToolContext
 from .tools.registry import ToolRegistry
 from .browser_bridge import router as browser_router, bridge
+from .voice import api as voice_api
+from .voice.api import router as voice_router
 from . import state  # noqa: F401  (registers state-machine guards)
 
 settings = get_settings()
@@ -48,6 +51,9 @@ async def lifespan(app: FastAPI):
     usage.get_plan(settings)  # an unknown plan name stops startup instead of silently meaning "unlimited"
     init_db()
     log_event("server_start")
+    threading.Thread(target=voice_api.get_chain, daemon=True).start()  # first spoken line should not pay setup
+    from .search import budget as _budget
+    threading.Thread(target=_budget.warm, daemon=True).start()  # tokenizer download (first run only)
     # The launcher runs one server. Never leave a crashed task showing as active
     # or replay its possibly completed device/file operation after restart.
     with SessionLocal() as db:
@@ -70,8 +76,6 @@ async def lifespan(app: FastAPI):
 
         prune(db, settings)
     if settings.tool_isolation == "process":
-        import threading
-
         from .orchestration import worker
         # Start one tool worker in the background so the first command does not pay its start-up cost.
         threading.Thread(target=worker.pool.warm, name="tool-worker-warmup", daemon=True).start()
@@ -85,6 +89,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
 app.include_router(browser_router)
+app.include_router(voice_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list({settings.frontend_origin, "http://localhost:5173", "http://127.0.0.1:5173"}),
@@ -96,7 +101,7 @@ app.add_middleware(
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]", "testserver"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-_PROTECTED_PREFIXES = ("/tasks", "/config", "/tools", "/usage", "/browser/connect-token", "/preferences", "/memory", "/metrics")
+_PROTECTED_PREFIXES = ("/tasks", "/config", "/tools", "/usage", "/browser/connect-token", "/preferences", "/memory", "/metrics", "/voice")
 
 
 @app.middleware("http")
@@ -198,6 +203,15 @@ def edit_memory(item_id: str, payload: prefs.MemoryIn, db: Session = Depends(get
     return prefs.memory_out(item)
 
 
+@app.delete("/memory")
+def delete_all_memory(db: Session = Depends(get_db)) -> dict:
+    """Delete every remembered note (the Memory page asks first). Task history is separate."""
+    count = db.query(MemoryItem).delete()
+    db.commit()
+    log_event("memory_deleted_all", count=count)
+    return {"deleted": count}
+
+
 @app.delete("/memory/{item_id}")
 def delete_memory(item_id: str, db: Session = Depends(get_db)) -> dict:
     item = db.get(MemoryItem, item_id)
@@ -219,6 +233,12 @@ def health() -> HealthOut:
     return HealthOut(status="ok", version=settings.app_version)
 
 
+def _search_status(s) -> dict[str, bool]:
+    from .search.tavily import TavilyProvider
+    from .search.wikipedia import WikipediaProvider
+    return {"wikipedia": WikipediaProvider(s.wikipedia_contact_email).available(), "tavily": TavilyProvider().available()}
+
+
 @app.get("/config/status", response_model=ConfigStatusOut)
 def config_status() -> ConfigStatusOut:
     # Never expose any API key - only whether one is configured.
@@ -236,6 +256,8 @@ def config_status() -> ConfigStatusOut:
         ai_configured=ai_configured,
         mock_mode=s.is_mock_mode,
         groq_configured=s.groq_configured,
+        speech_ready=s.groq_configured or s.cloud_configured,
+        search=_search_status(s),
         agent_max_steps=s.agent_max_steps,
         fallback_provider=s.ai_fallback_provider,
         cloud_mode=s.ai_cloud_mode,
