@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: agentdesk-cloud
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-cloud.txt
+    startCommand: uvicorn app.cloud_main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: CLOUD_API_TOKEN
+        generateValue: true
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: AI_PROVIDER
+        value: groq
+      - key: CLOUD_RATE_PER_MINUTE
+        value: "30"
