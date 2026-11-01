@@ -434,13 +434,21 @@ def run_task(db: Session, task_id: str, registry: ToolRegistry, settings: Settin
             if a.status == ActionStatus.APPROVED:
                 a.status = ActionStatus.SKIPPED
         verified_before = any(a.status == ActionStatus.SUCCEEDED for a in task.actions)
-        task.status = TaskStatus.PARTIALLY_COMPLETED if verified_before else TaskStatus.FAILED
         failed_action = next((a for a in runnable if a.status == ActionStatus.FAILED), None)
-        task.error = failed_action.error if failed_action else "One or more actions failed; remaining actions were skipped."
+        error = failed_action.error if failed_action else "One or more actions failed; remaining actions were skipped."
         if failed_action and json.loads(failed_action.result_json or "{}").get("output", {}).get("needs_confirmation"):
+            # "Closest installed apps: ...": ask the user which one. (Setting FAILED first and then AWAITING_INPUT was an illegal
+            # state change: /run answered HTTP 500 and the task stayed "executing" forever.)
             task.status = TaskStatus.AWAITING_INPUT
-            task.plan_note = task.error
+            output = json.loads(failed_action.result_json or "{}").get("output", {})
+            candidates = [str(c) for c in output.get("candidates") or []][:3]
+            asked = str(json.loads(failed_action.args_json or "{}").get("app_name", "")).strip()
+            # a short question the user can read and hear, not the wording meant for the model
+            task.plan_note = (f"I couldn't find \"{asked}\". Did you mean {' or '.join(candidates)}? Say yes, or the exact name." if candidates else error)
             task.error = None
+        else:
+            task.status = TaskStatus.PARTIALLY_COMPLETED if verified_before else TaskStatus.FAILED
+            task.error = error
     elif task.status == TaskStatus.CANCELLED:
         pass  # keep cancellation
     else:
@@ -611,7 +619,9 @@ def _nlu_fallback(command: str, registry: ToolRegistry) -> Plan | None:
     from ..nlu import THRESHOLD, match, validate_plan
     from ..nlu.schema import STEP_REF
 
-    result = match(command)
+    from ..ai.speech_commands import clean_transcript
+
+    result = match(clean_transcript(command))
     plan = result.plan
     if plan is None or result.confidence < THRESHOLD or plan.intent in _NLU_FALLBACK_INTENTS_SKIP or not plan.steps:
         return None
@@ -673,7 +683,16 @@ def start_task(
         if settings.ai_cloud_mode != "automatic" and not command.strip().casefold().startswith(("ai:", "research ", "explain ")):
             return plan_task(db, task, registry, settings, preplanned=Plan(note="Local agent ko yeh command clear nahi hui. App/file ka naam aur operation batayein. Detailed AI reasoning ke liye 'AI:' ya 'research' se request shuru karein."))
     structured = planner_mode.structured_plan(command, registry, settings)
+    if structured is None and planner_mode.mode(settings) != "structured":
+        structured = planner_mode.routing_plan(command, registry, settings)  # legacy / shadow: routing intents only
+        routed = conversation_flow.route_by_intent(db, task, structured, command, registry, settings, auto_approve=auto_approve) if structured else None
+        if routed is not None:
+            return routed
+        structured = None
     if structured is not None:
+        routed = conversation_flow.route_by_intent(db, task, structured, command, registry, settings, auto_approve=auto_approve)
+        if routed is not None:
+            return routed
         task.agent_state_json = json.dumps({"provider": "local", "matcher": "structured"})
         task = plan_task(db, task, registry, settings, auto_approve=auto_approve, preplanned=structured)
         if task.status == TaskStatus.APPROVED:

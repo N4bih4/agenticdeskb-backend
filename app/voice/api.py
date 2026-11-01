@@ -132,6 +132,17 @@ def spoken_line(body: LineIn) -> dict:
     return {"text": text}
 
 
+def _vocabulary_prompt(prompt: str | None) -> str | None:
+    """The browser's hint plus this PC's own app / file / contact names. A broken index only means no extra hint."""
+    try:
+        from ..nlu.correction_memory import current
+        from ..nlu.entity_index import get_index
+        from .stt_vocab import build_prompt
+        return build_prompt(get_index(), current(), prompt) or prompt
+    except Exception:  # noqa: BLE001
+        return prompt
+
+
 @router.post("/stt")
 async def stt(audio: UploadFile = File(...), language: str | None = Form(default=None),
               prompt: str | None = Form(default=None)) -> dict:
@@ -142,9 +153,16 @@ async def stt(audio: UploadFile = File(...), language: str | None = Form(default
     if client is None:
         raise HTTPException(503, "No speech service is configured (set GROQ_API_KEYS or CLOUD_BRAIN_URL).")
     name = audio.filename or "speech.wav"
+    prompt = _vocabulary_prompt(prompt)
     try:
         if hasattr(client, "transcribe") and client.__class__.__name__ == "CloudBrain":
-            return {"text": client.transcribe(data, name, language, prompt)}
+            try:
+                return {"text": client.transcribe(data, name, language, prompt)}
+            except (AIError, AIConfigError):  # cloud asleep / unreachable: use this machine's Groq key if it has one
+                if not get_settings().groq_configured:
+                    raise
+                from ..ai.groq_client import get_groq_client
+                client = get_groq_client()
         result = client.transcribe(data, filename=name, language=language, prompt=prompt)
         return {"text": result["text"], "language": result.get("language"), "model": result.get("model")}
     except AIRateLimitError as exc:

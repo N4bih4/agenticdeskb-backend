@@ -148,16 +148,26 @@ _COMMAND_VERB = re.compile(
     r"install|uninstall|start|launch|run|kholo|band|banao|hatao|chalao|lagao|bhejo|kar do|karo|खोलो|बंद|बनाओ|चलाओ|کھولو|بند|بناؤ|چلاؤ)\b", re.I)
 
 
-def classify(command: str) -> str | None:
-    """'web' (needs current facts), 'chat' (answer from knowledge / small talk) or None (not a question: leave unchanged).
+# Text this fast path must NOT guess about: it mentions the user's memory, or names a page / file. The planner's intent
+# decides those (a memory question sent to the cloud chat, or a URL containing "news" sent to web search, were real misroutes).
+_DEFER = re.compile(
+    r"\babout me\b|\bon me\b|\bof mine\b|\bmy (?:memor(?:y|ies)|notes?)\b|\bremember\b|\bforget\b|\bsave[ds]?\b|\bstored?\b|"
+    r"yaad|bhool|bhul|mere b(?:aa|a)re|meray baray|میرے بارے|یاد|بھول|मेरे बारे|याद|भूल", re.I)
 
-    Called only after the command parsers had no answer, so a real command rarely reaches it; imperative verbs
-    still stay out of chat so a mistyped command is asked about instead of answered with a lecture.
+
+def classify(command: str) -> str | None:
+    """'web' (needs current facts), 'chat' (answer from knowledge / small talk) or None (not decided here).
+
+    This is the FAST PATH of question routing; with PLANNER_MODE=structured the planner's `intent` decides everything
+    it returns None for. Called only after the command parsers had no answer, so a real command rarely reaches it;
+    imperative verbs still stay out of chat so a mistyped command is asked about instead of answered with a lecture.
     """
     text = " ".join(command.strip().split())
     if len(text) < 2:
         return None
     if _COMMAND_VERB.match(text) and "?" not in text:
+        return None
+    if _DEFER.search(text) or _URL.search(text) or _WIN_PATH.search(text + " "):
         return None
     if _WEB.search(text):
         return "web"
@@ -196,20 +206,28 @@ def summary_plan(command: str) -> Plan | None:
 
 
 # ------------------------------------------------------------------ memory voice commands
-_REMEMBER = re.compile(r"^(?:please\s+|hey\s+)?(?:remember|yaad rakho|yaad rakhna|yaad kar lo)\b[:,]?\s*(?:that\s+)?(.+)$", re.I)
-_REMEMBER_TAIL = re.compile(r"^(.+?)\s+yaad rakh(?:o|na|\s?lo)$", re.I)
+_REMEMBER_WORDS = r"yaad rakho|yaad rakhna|yaad kar lo|یاد رکھو|یاد رکھنا|یاد کر لو|याद रखो|याद रखना|याद कर लो"
+_FORGET_WORDS = r"bhool jao|bhul jao|بھول جاؤ|بھول جائیں|भूल जाओ|भूल जाइए"
+_POSSESSIVE = r"(?:my\s+|the\s+|that\s+|meri\s+|mera\s+|میرا\s+|میری\s+|मेरा\s+|मेरी\s+)?"
+_REMEMBER = re.compile(rf"^(?:please\s+|hey\s+)?(?:remember|{_REMEMBER_WORDS})(?!\w)[:,]?\s*(?:that\s+)?(.+)$", re.I)
+_REMEMBER_TAIL = re.compile(rf"^(.+?)\s+(?:yaad rakh(?:o|na|\s?lo)|{_REMEMBER_WORDS})$", re.I)
 _RECALL = re.compile(
     r"what (?:do|did|have) you (?:remember(?:ed)?|know|saved|stored) about me|what do you remember|what have you (?:learned|remembered)|"
-    r"(?:mere|meray) (?:baare|bare|bary) mein (?:kya|kuch) (?:yaad|pata|jaante|jante)|tum mere (?:baare|bare) mein kya|show (?:me )?my memor(?:y|ies)",
+    r"(?:mere|meray) (?:baare|bare|bary) mein (?:kya|kuch) (?:yaad|pata|jaante|jante)|tum mere (?:baare|bare) mein kya|show (?:me )?my memor(?:y|ies)|"
+    r"(?:تمہیں )?میرے بارے میں (?:کیا|کچھ) (?:یاد|جانتے|پتا)|میری (?:یادداشتیں|میموری میں کیا)|"
+    r"(?:तुम्हें )?मेरे बारे में (?:क्या|कुछ) (?:याद|जानते|पता)|मेरी (?:यादें|मेमोरी में क्या)",
     re.I)
-_FORGET = re.compile(r"^(?:please\s+)?(?:forget|bhool jao|bhul jao)\b[:,]?\s*(?:about\s+)?(?:my\s+|the\s+|that\s+|meri\s+|mera\s+)?(.+)$", re.I)
+_FORGET = re.compile(rf"^(?:please\s+)?(?:forget|bhool jao|bhul jao|{_FORGET_WORDS})(?!\w)[:,]?\s*(?:about\s+)?{_POSSESSIVE}(.+)$", re.I)
+_FORGET_TAIL = re.compile(rf"^{_POSSESSIVE}(.+?)\s+(?:bhool jao|bhul jao|{_FORGET_WORDS})$", re.I)
 
 
 def memory_plan(command: str) -> Plan | None:
-    text = " ".join(command.strip().split())
+    from .ai.speech_commands import strip_end_punctuation
+
+    text = strip_end_punctuation(" ".join(command.strip().split()))  # a transcript ends with "." which must not be stored
     if _RECALL.search(text):
         return Plan(actions=[PlanAction(tool="memory_recall", args={}, rationale="Read what is stored about the user")], note="Checking my memory.")
-    m = _FORGET.match(text)
+    m = _FORGET.match(text) or _FORGET_TAIL.match(text)
     if m and m.group(1).strip():
         return Plan(actions=[PlanAction(tool="memory_forget", args={"query": m.group(1).strip()[:200]}, rationale="Delete the matching memory")],
                     note="I'll forget that once you confirm.")
